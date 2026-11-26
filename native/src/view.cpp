@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <unordered_set>
 
 namespace artseek {
@@ -70,6 +71,109 @@ int32_t countViewSubtree(ArtRuntime& rt, uint64_t v, std::unordered_set<uint64_t
     return total;
 }
 
+// 2D affine map: x' = a*x + b*y + tx, y' = c*x + d*y + ty.
+struct Affine {
+    double a = 1, b = 0, c = 0, d = 1, tx = 0, ty = 0;
+
+    static Affine translate(double x, double y) { return Affine{1, 0, 0, 1, x, y}; }
+
+    // this ∘ o: apply o first, then this.
+    Affine mul(const Affine& o) const {
+        return Affine{a * o.a + b * o.c, a * o.b + b * o.d, c * o.a + d * o.c, c * o.b + d * o.d,
+                      a * o.tx + b * o.ty + tx, c * o.tx + d * o.ty + ty};
+    }
+
+    bool isIdentity() const { return a == 1 && b == 0 && c == 0 && d == 1 && tx == 0 && ty == 0; }
+    bool isTranslate() const { return a == 1 && b == 0 && c == 0 && d == 1; }
+
+    // Bounding box of the rect (0,0,w,h) after mapping.
+    Rect mapBox(double w, double h) const {
+        double xs[4] = {tx, a * w + tx, b * h + tx, a * w + b * h + tx};
+        double ys[4] = {ty, c * w + ty, d * h + ty, c * w + d * h + ty};
+        return Rect{static_cast<int32_t>(std::lround(*std::min_element(xs, xs + 4))),
+                    static_cast<int32_t>(std::lround(*std::min_element(ys, ys + 4))),
+                    static_cast<int32_t>(std::lround(*std::max_element(xs, xs + 4))),
+                    static_cast<int32_t>(std::lround(*std::max_element(ys, ys + 4)))};
+    }
+};
+
+// Where libhwui keeps a view's transform. Since Android 5 translation, scale, rotation and
+// pivot live only in the native RenderNode (RenderProperties::PrimitiveFields); the Java
+// View has no copy. The struct offset differs between builds, so it is located at runtime
+// by a signature every RenderNode carries: the six ints left, top, right, bottom, width,
+// height, which must equal the Java View's own bounds. A RenderNode holds two such blocks
+// (the properties being displayed, then the staging ones).
+struct RenderNodeLayout {
+    int pid = -1;
+    bool resolved = false;
+    std::vector<uint32_t> boundsOffs; // offset of mLeft in each properties block
+    uint32_t alphaRel = 0;            // offset of mAlpha relative to mLeft
+};
+
+RenderNodeLayout g_rnLayout;
+
+constexpr size_t kRnScanBytes = 2048;
+// Relative to mAlpha: translationX/Y/Z, elevation, rotation, rotationX/Y, scaleX/Y, pivotX/Y,
+// then bool hasOverlappingRendering, bool pivotExplicitlySet.
+constexpr uint32_t kRnFloatsAfterAlpha = 11;
+constexpr uint32_t kRnBlockTail = 4 + kRnFloatsAfterAlpha * 4 + 2;
+
+uint64_t nativeRenderNode(ArtRuntime& rt, uint64_t view, const FieldLayout& viewFl) {
+    uint64_t rn = rt.readRefField(view, viewFl, "mRenderNode");
+    if (rn < 0x1000) return 0;
+    uint64_t kl = rt.mem().u32(rn + rt.layout().klass_off);
+    if (kl < 0x1000) return 0;
+    const auto& fl = rt.fieldLayout(kl);
+    if (!fl.byName.count("mNativeRenderNode")) return 0;
+    uint64_t ptr = untag(static_cast<uint64_t>(rt.readLongField(rn, fl, "mNativeRenderNode", 0)));
+    return ptr >= 0x1000 ? ptr : 0;
+}
+
+bool boundsMatch(const uint8_t* at, const int32_t want[6]) {
+    return std::memcmp(at, want, 6 * sizeof(int32_t)) == 0;
+}
+
+// Tries to locate the properties blocks using one view whose bounds are distinctive.
+bool calibrateRenderNode(ArtRuntime& rt, uint64_t nativePtr, const int32_t want[6]) {
+    std::vector<uint8_t> buf(kRnScanBytes);
+    // Native memory changes without the heap moving, so bypass the page cache.
+    size_t got = rt.mem().readRaw(nativePtr, buf.data(), buf.size());
+    if (got < 256) return false;
+    std::vector<uint32_t> offs;
+    uint32_t alphaRel = 0;
+    for (uint32_t off = 0; off + 24 + 16 + kRnBlockTail <= got; off += 4) {
+        if (!boundsMatch(buf.data() + off, want)) continue;
+        // After the six ints come the clipping flags, on Android 9+ two shadow colours, then
+        // alpha and the transform floats. Pick the variant whose values are plausible for a
+        // laid-out view; shadow colours read as floats do not pass (alpha range, scale != 0).
+        uint32_t rel = 0;
+        for (uint32_t cand : {36u, 28u}) {
+            float alpha, sx, sy, fl[kRnFloatsAfterAlpha];
+            std::memcpy(&alpha, buf.data() + off + cand, 4);
+            std::memcpy(fl, buf.data() + off + cand + 4, sizeof(fl));
+            sx = fl[7];
+            sy = fl[8];
+            bool ok = alpha >= 0.0f && alpha <= 1.0f;
+            for (float x : fl) ok = ok && std::isfinite(x) && std::fabs(x) < 1e6f;
+            ok = ok && std::fabs(sx) > 1e-3f && std::fabs(sx) < 1e3f && std::fabs(sy) > 1e-3f && std::fabs(sy) < 1e3f;
+            if (ok) {
+                rel = cand;
+                break;
+            }
+        }
+        if (rel == 0) continue;
+        if (!offs.empty() && rel != alphaRel) continue;
+        alphaRel = rel;
+        offs.push_back(off);
+        off += 24; // blocks cannot overlap
+    }
+    if (offs.empty()) return false;
+    g_rnLayout.boundsOffs = std::move(offs);
+    g_rnLayout.alphaRel = alphaRel;
+    g_rnLayout.resolved = true;
+    return true;
+}
+
 struct BasicViewProps {
     uint64_t addr = 0;
     uint64_t klass = 0;
@@ -85,7 +189,12 @@ struct BasicViewProps {
     float alpha = 1.0f;
     int32_t left = 0, top = 0, right = 0, bottom = 0;
     int32_t scrollX = 0, scrollY = 0;
-    int32_t transX = 0, transY = 0;
+    // The view's own matrix: maps its (0,0,w,h) rect into the parent, relative to (left, top).
+    Affine local;
+    // "" (none), "translate", "affine", or "approximate" when the transform could not be
+    // read exactly (3D rotation, or the RenderNode did not match the view).
+    std::string transform;
+    uint64_t nativeNode = 0;
     std::string text;
     std::string desc;
     std::string tag;
@@ -153,15 +262,55 @@ BasicViewProps readBasicViewProps(ArtRuntime& rt, uint64_t v, bool readStrings =
                 float a = rt.readFloatField(ti, tfl, "mAlpha", 1.0f);
                 if (std::isfinite(a) && a >= 0.0f && a <= 1.0f) p.alpha = a;
             }
-            if (tfl.byName.count("mTranslationX")) {
-                float tx = rt.readFloatField(ti, tfl, "mTranslationX", 0.0f);
-                if (std::isfinite(tx)) p.transX = static_cast<int32_t>(std::lround(tx));
-            }
-            if (tfl.byName.count("mTranslationY")) {
-                float ty = rt.readFloatField(ti, tfl, "mTranslationY", 0.0f);
-                if (std::isfinite(ty)) p.transY = static_cast<int32_t>(std::lround(ty));
+            // Android 4.x kept translation in TransformationInfo.
+            float ltx = 0.0f, lty = 0.0f;
+            if (tfl.byName.count("mTranslationX")) ltx = rt.readFloatField(ti, tfl, "mTranslationX", 0.0f);
+            if (tfl.byName.count("mTranslationY")) lty = rt.readFloatField(ti, tfl, "mTranslationY", 0.0f);
+            if (std::isfinite(ltx) && std::isfinite(lty) && (ltx != 0.0f || lty != 0.0f)) {
+                p.local = Affine::translate(ltx, lty);
+                p.transform = "translate";
             }
         }
+    }
+
+    p.nativeNode = nativeRenderNode(rt, v, fl);
+    if (g_rnLayout.resolved && g_rnLayout.pid == rt.mem().pid() && p.nativeNode != 0) {
+        const int32_t want[6] = {p.left, p.top, p.right, p.bottom, p.right - p.left, p.bottom - p.top};
+        const uint32_t blockLen = g_rnLayout.alphaRel + kRnBlockTail;
+        uint8_t blk[96];
+        bool matched = false;
+        for (uint32_t off : g_rnLayout.boundsOffs) {
+            if (rt.mem().readRaw(p.nativeNode + off, blk, blockLen) != blockLen) continue;
+            if (!boundsMatch(blk, want)) continue;
+            matched = true;
+            float fv[kRnFloatsAfterAlpha];
+            std::memcpy(fv, blk + g_rnLayout.alphaRel + 4, sizeof(fv));
+            bool finite = true;
+            for (float x : fv) finite = finite && std::isfinite(x);
+            if (!finite) { matched = false; continue; }
+            const double tx = fv[0], ty = fv[1], rot = fv[4], rotX = fv[5], rotY = fv[6];
+            const double sx = fv[7], sy = fv[8];
+            const bool pivotSet = blk[g_rnLayout.alphaRel + 4 + sizeof(fv) + 1] != 0;
+            const double px = pivotSet ? fv[9] : want[4] / 2.0;
+            const double py = pivotSet ? fv[10] : want[5] / 2.0;
+            // Same composition as RenderProperties::updateMatrix: T * R(pivot) * S(pivot).
+            const double rad = rot * 3.14159265358979323846 / 180.0;
+            const double co = std::cos(rad), si = std::sin(rad);
+            Affine m = Affine::translate(tx, ty)
+                           .mul(Affine::translate(px, py))
+                           .mul(Affine{co, -si, si, co, 0, 0})
+                           .mul(Affine{sx, 0, 0, sy, 0, 0})
+                           .mul(Affine::translate(-px, -py));
+            if (rot == 0.0 && sx == 1.0 && sy == 1.0) m = Affine::translate(tx, ty);
+            p.local = m;
+            if (rotX != 0.0 || rotY != 0.0) p.transform = "approximate";
+            else if (m.isIdentity()) p.transform.clear();
+            else p.transform = m.isTranslate() ? "translate" : "affine";
+            break;
+        }
+        // No block agrees with the Java bounds: the node is mid-update or not a RenderNode
+        // of the expected shape. Keep the layout position and say so.
+        if (!matched) p.transform = "approximate";
     }
 
     p.parent = rt.readRefField(v, fl, "mParent");
@@ -322,8 +471,19 @@ ViewRootInfo readOneViewRoot(ArtRuntime& rt, uint64_t vriAddr, bool countNodes) 
     return info;
 }
 
+struct Placed {
+    Rect bounds;    // screen bounding box of the view
+    Affine content; // maps the view's content coordinates (children's left/top) to the screen
+};
+
+Placed placeView(const Affine& parent, const BasicViewProps& p) {
+    Affine own = parent.mul(Affine::translate(p.left, p.top)).mul(p.local);
+    return Placed{own.mapBox(p.right - p.left, p.bottom - p.top),
+                  own.mul(Affine::translate(-p.scrollX, -p.scrollY))};
+}
+
 Json walkTreeNode(ArtRuntime& rt, uint64_t v,
-                  int32_t parentOriginX, int32_t parentOriginY,
+                  const Affine& parentXf,
                   const Rect& parentClip, const Rect& viewportRect,
                   bool parentEffVis, int depth, int maxDepth,
                   std::unordered_set<uint64_t>& visited) {
@@ -334,9 +494,8 @@ Json walkTreeNode(ArtRuntime& rt, uint64_t v,
     if (p.klass < 0x1000) return Json(nullptr);
 
     Rect localBounds{p.left, p.top, p.right, p.bottom};
-    int32_t sx = parentOriginX + p.left + p.transX;
-    int32_t sy = parentOriginY + p.top + p.transY;
-    Rect screenBounds{sx, sy, sx + (p.right - p.left), sy + (p.bottom - p.top)};
+    Placed pl = placeView(parentXf, p);
+    Rect screenBounds = pl.bounds;
     bool effVis = parentEffVis && (p.visBits == 0) && (p.alpha > 0.0f);
     Rect visibleBounds = effVis ? screenBounds.intersect(parentClip) : Rect{0, 0, 0, 0};
 
@@ -359,6 +518,7 @@ Json walkTreeNode(ArtRuntime& rt, uint64_t v,
     node.set("text", p.text);
     node.set("desc", p.desc);
     node.set("tag", p.tag);
+    if (!p.transform.empty()) node.set("transform", p.transform);
     node.set("localBounds", localBounds.toJson());
     node.set("screenBounds", screenBounds.toJson());
     node.set("visibleBounds", visibleBounds.toJson());
@@ -369,13 +529,11 @@ Json walkTreeNode(ArtRuntime& rt, uint64_t v,
     if (p.childrenArr >= 0x1000 && p.childrenCount > 0 && depth < maxDepth) {
         int32_t alen = rt.mem().i32(p.childrenArr + 8);
         int32_t lim = std::min({p.childrenCount, alen, 4000});
-        int32_t childOriginX = sx - p.scrollX;
-        int32_t childOriginY = sy - p.scrollY;
         Rect childClip = visibleBounds.empty() ? Rect{0, 0, 0, 0} : visibleBounds;
         for (int32_t i = 0; i < lim; ++i) {
             uint64_t c = rt.mem().u32(p.childrenArr + 12 + static_cast<uint64_t>(i) * 4);
             if (c < 0x1000) continue;
-            Json cj = walkTreeNode(rt, c, childOriginX, childOriginY, childClip,
+            Json cj = walkTreeNode(rt, c, pl.content, childClip,
                                    childViewport, effVis, depth + 1, maxDepth, visited);
             if (!cj.isNull()) kids.push(std::move(cj));
         }
@@ -562,6 +720,47 @@ std::vector<ActivityRecordInfo> findActivities(ArtRuntime& rt, const std::vector
     return out;
 }
 
+// Locates the transform fields inside libhwui's RenderNode once per target process.
+// Returns false when no attached view allowed it; bounds then exclude view transforms.
+bool ensureRenderNodeLayout(ArtRuntime& rt) {
+    if (g_rnLayout.pid == rt.mem().pid() && g_rnLayout.resolved) return true;
+    g_rnLayout = RenderNodeLayout{};
+    g_rnLayout.pid = rt.mem().pid();
+
+    std::vector<uint64_t> queue;
+    for (const auto& vr : findViewRoots(rt, false)) {
+        if (vr.viewAddr >= 0x1000) queue.push_back(vr.viewAddr);
+    }
+    std::unordered_set<uint64_t> seen;
+    int attempts = 0;
+    for (size_t i = 0; i < queue.size() && i < 4000 && attempts < 32; ++i) {
+        uint64_t v = queue[i];
+        if ((v & 7) != 0 || !seen.insert(v).second) continue;
+        BasicViewProps p = readBasicViewProps(rt, v, false);
+        if (p.klass < 0x1000) continue;
+        int32_t w = p.right - p.left, h = p.bottom - p.top;
+        // Six ints that are unlikely to occur by chance: a real size at a non-zero position.
+        if (p.nativeNode != 0 && w > 8 && h > 8 && w != h && p.left > 0 && p.top > 0 && p.left != p.top) {
+            ++attempts;
+            const int32_t want[6] = {p.left, p.top, p.right, p.bottom, w, h};
+            if (calibrateRenderNode(rt, p.nativeNode, want)) return true;
+        }
+        if (p.childrenArr >= 0x1000 && p.childrenCount > 0) {
+            int32_t alen = rt.mem().i32(p.childrenArr + 8);
+            int32_t lim = std::min({p.childrenCount, alen, 4000});
+            for (int32_t k = 0; k < lim; ++k) {
+                uint64_t c = rt.mem().u32(p.childrenArr + 12 + static_cast<uint64_t>(k) * 4);
+                if (c >= 0x1000) queue.push_back(c);
+            }
+        }
+    }
+    return false;
+}
+
+const char* transformSource() {
+    return g_rnLayout.resolved ? "rendernode" : "unavailable";
+}
+
 uint64_t findCurrentActivity(ArtRuntime& rt) {
     auto roots = findViewRoots(rt, false);
     auto acts = findActivities(rt, &roots);
@@ -611,6 +810,7 @@ Json opRoots(ArtRuntime& rt) {
 }
 
 Json opTree(ArtRuntime& rt, bool onlyFocused, uint64_t filterRootAddr, int maxDepth) {
+    ensureRenderNodeLayout(rt);
     auto allRoots = findViewRoots(rt, false);
     Json rootsJson = Json::array();
 
@@ -624,7 +824,7 @@ Json opTree(ArtRuntime& rt, bool onlyFocused, uint64_t filterRootAddr, int maxDe
         Rect screenRect = inferScreenRect(vr, allRoots);
         std::unordered_set<uint64_t> visited;
         Json treeNode = walkTreeNode(rt, vr.viewAddr,
-                                     vr.winFrame.left, vr.winFrame.top,
+                                     Affine::translate(vr.winFrame.left, vr.winFrame.top),
                                      screenRect, screenRect,
                                      vr.windowVisibility == 0,
                                      0, maxDepth, visited);
@@ -638,10 +838,11 @@ Json opTree(ArtRuntime& rt, bool onlyFocused, uint64_t filterRootAddr, int maxDe
         rootsJson.push(std::move(entry));
     }
 
-    return Json::object({{"roots", std::move(rootsJson)}});
+    return Json::object({{"roots", std::move(rootsJson)}, {"transformSource", transformSource()}});
 }
 
 uint64_t findViewByFilter(ArtRuntime& rt, const ViewFilter& filter) {
+    ensureRenderNodeLayout(rt);
     auto allRoots = findViewRoots(rt, false);
     if (allRoots.empty()) return 0;
 
@@ -655,7 +856,7 @@ uint64_t findViewByFilter(ArtRuntime& rt, const ViewFilter& filter) {
         Rect screenRect = inferScreenRect(vr, allRoots);
         std::unordered_set<uint64_t> visited;
 
-        auto dfs = [&](auto& self, uint64_t v, int32_t ox, int32_t oy,
+        auto dfs = [&](auto& self, uint64_t v, const Affine& xf,
                        const Rect& clip, bool parentEffVis, int depth) -> void {
             if (exactA11yFound) return;
             if (v < 0x1000 || (v & 7) != 0 || depth > 128 || !visited.insert(v).second) return;
@@ -673,9 +874,8 @@ uint64_t findViewByFilter(ArtRuntime& rt, const ViewFilter& filter) {
                 }
             } else {
                 // Scoring match when a11yViewId is absent
-                int32_t sx = ox + p.left + p.transX;
-                int32_t sy = oy + p.top + p.transY;
-                Rect sb{sx, sy, sx + (p.right - p.left), sy + (p.bottom - p.top)};
+                Placed pl = placeView(xf, p);
+                Rect sb = pl.bounds;
                 bool effVis = parentEffVis && (p.visBits == 0) && (p.alpha > 0.0f);
 
                 bool ok = true;
@@ -733,9 +933,8 @@ uint64_t findViewByFilter(ArtRuntime& rt, const ViewFilter& filter) {
             }
 
             if (p.childrenArr >= 0x1000 && p.childrenCount > 0) {
-                int32_t sx = ox + p.left + p.transX;
-                int32_t sy = oy + p.top + p.transY;
-                Rect sb{sx, sy, sx + (p.right - p.left), sy + (p.bottom - p.top)};
+                Placed pl = placeView(xf, p);
+                Rect sb = pl.bounds;
                 bool effVis = parentEffVis && (p.visBits == 0) && (p.alpha > 0.0f);
                 Rect vb = effVis ? sb.intersect(clip) : Rect{0, 0, 0, 0};
                 int32_t alen = rt.mem().i32(p.childrenArr + 8);
@@ -743,13 +942,13 @@ uint64_t findViewByFilter(ArtRuntime& rt, const ViewFilter& filter) {
                 for (int32_t i = 0; i < lim && !exactA11yFound; ++i) {
                     uint64_t c = rt.mem().u32(p.childrenArr + 12 + static_cast<uint64_t>(i) * 4);
                     if (c >= 0x1000) {
-                        self(self, c, sx - p.scrollX, sy - p.scrollY, vb, effVis, depth + 1);
+                        self(self, c, pl.content, vb, effVis, depth + 1);
                     }
                 }
             }
         };
 
-        dfs(dfs, vr.viewAddr, vr.winFrame.left, vr.winFrame.top, screenRect, vr.windowVisibility == 0, 0);
+        dfs(dfs, vr.viewAddr, Affine::translate(vr.winFrame.left, vr.winFrame.top), screenRect, vr.windowVisibility == 0, 0);
         if (exactA11yFound) break;
     }
 
@@ -760,6 +959,7 @@ Json computeViewMeta(ArtRuntime& rt, uint64_t viewAddr) {
     if (viewAddr < 0x1000 || (viewAddr & 7) != 0) return Json(nullptr);
     uint64_t kl = rt.mem().u32(viewAddr + rt.layout().klass_off);
     if (!rt.isViewClass(kl)) return Json(nullptr);
+    ensureRenderNodeLayout(rt);
 
     // 1) Walk mParent upward to collect ancestor chain [view, p1, p2, ..., decorView] and detect ViewRootImpl
     std::vector<BasicViewProps> chain; // chain[0] = target view, chain.back() = root View
@@ -830,17 +1030,15 @@ Json computeViewMeta(ArtRuntime& rt, uint64_t viewAddr) {
     std::vector<Rect> visibleBoundsVec(n);
     std::vector<bool> effVisVec(n, false);
 
-    int32_t originX = winFrame.left;
-    int32_t originY = winFrame.top;
+    Affine xf = Affine::translate(winFrame.left, winFrame.top);
     Rect curClip = screenRect;
     bool curEffVis = rootWinVis;
 
     for (size_t rev = 0; rev < n; ++rev) {
         size_t idx = n - 1 - rev;
         const auto& p = chain[idx];
-        int32_t sx = originX + p.left + p.transX;
-        int32_t sy = originY + p.top + p.transY;
-        Rect sb{sx, sy, sx + (p.right - p.left), sy + (p.bottom - p.top)};
+        Placed pl = placeView(xf, p);
+        Rect sb = pl.bounds;
         bool ev = curEffVis && (p.visBits == 0) && (p.alpha > 0.0f);
         Rect vb = ev ? sb.intersect(curClip) : Rect{0, 0, 0, 0};
 
@@ -848,8 +1046,7 @@ Json computeViewMeta(ArtRuntime& rt, uint64_t viewAddr) {
         visibleBoundsVec[idx] = vb;
         effVisVec[idx] = ev;
 
-        originX = sx - p.scrollX;
-        originY = sy - p.scrollY;
+        xf = pl.content;
         curClip = vb;
         curEffVis = ev;
     }
@@ -896,6 +1093,8 @@ Json computeViewMeta(ArtRuntime& rt, uint64_t viewAddr) {
     out.set("visibility", visibilityString(self.visBits));
     out.set("effectiveVisible", static_cast<bool>(effVisVec[0]));
     out.set("alpha", static_cast<double>(self.alpha));
+    if (!self.transform.empty()) out.set("transform", self.transform);
+    out.set("transformSource", transformSource());
     out.set("clickable", self.clickable);
     out.set("scrollable", self.scrollable);
     out.set("enabled", self.enabled);

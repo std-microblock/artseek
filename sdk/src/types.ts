@@ -158,6 +158,13 @@ export interface ViewMeta {
   visibility: Visibility;
   effectiveVisible: boolean;
   alpha: number;
+  /**
+   * Present when the view has a transform of its own. `"translate"` and `"affine"`
+   * (scale/rotation) are exact: bounds are the transformed bounding box and descendants
+   * inherit the full matrix. `"approximate"` means it could not be read exactly (3D
+   * rotation, or the native node did not match the view), so bounds may be off.
+   */
+  transform?: 'translate' | 'affine' | 'approximate';
   clickable: boolean;
   scrollable: boolean;
   enabled: boolean;
@@ -173,6 +180,8 @@ export interface ViewMeta {
   isFocusedWindow: boolean;
   scrollableAncestor: ScrollableAncestor | null;
   parentChain: ParentChainEntry[];
+  /** See {@link TreeResult.transformSource}. */
+  transformSource: 'rendernode' | 'unavailable';
 }
 
 // ---------------------------------------------------------------------------
@@ -259,6 +268,13 @@ export interface ViewTreeNode {
   text: string | null;
   desc: string | null;
   tag: unknown;
+  /**
+   * Present when the view has a transform of its own. `"translate"` and `"affine"`
+   * (scale/rotation) are exact: bounds are the transformed bounding box and descendants
+   * inherit the full matrix. `"approximate"` means it could not be read exactly (3D
+   * rotation, or the native node did not match the view), so bounds may be off.
+   */
+  transform?: 'translate' | 'affine' | 'approximate';
   localBounds: Bounds;
   screenBounds: Bounds;
   visibleBounds: Bounds;
@@ -277,6 +293,11 @@ export interface TreeRootEntry {
 
 export interface TreeResult {
   roots: TreeRootEntry[];
+  /**
+   * Where view transforms were read from. `"unavailable"` means the native RenderNode layout
+   * could not be located in this process, so no bounds include translation, scale or rotation.
+   */
+  transformSource: 'rendernode' | 'unavailable';
 }
 
 export interface StrSearchParams {

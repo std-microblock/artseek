@@ -126,7 +126,9 @@ Returns:
 Params: `{ onlyFocused?: boolean, rootAddr?: string, maxDepth?: number }`.
 Returns `{ roots: Array<{ rootAddr, activityClass, hasWindowFocus, winFrame, tree: ViewTreeNode }> }`.
 Each `ViewTreeNode` has:
-`addr`, `className`, `superClasses`, `a11yViewId`, `resourceIdInt`, `visibility` (`"VISIBLE" | "INVISIBLE" | "GONE"`), `effectiveVisible`, `clickable`, `scrollable`, `enabled`, `text`, `desc`, `tag`, `localBounds`, `screenBounds`, `visibleBounds`, `inViewport`, `visibleAreaRatio`, `children`.
+`addr`, `className`, `superClasses`, `a11yViewId`, `resourceIdInt`, `visibility` (`"VISIBLE" | "INVISIBLE" | "GONE"`), `effectiveVisible`, `clickable`, `scrollable`, `enabled`, `text`, `desc`, `tag`, `localBounds`, `screenBounds`, `visibleBounds`, `inViewport`, `visibleAreaRatio`, `children`, and `transform` when the view has a transform matrix.
+
+`transform` is `"translate"`, `"affine"` (scale/rotation) or `"approximate"`. Translation, scale, rotation and pivot are read from the view's native `RenderNode` (libhwui `RenderProperties`), where Android keeps them since 5.0; the block is located at runtime by matching the view's own left/top/right/bottom/width/height. `screenBounds` is the transformed bounding box and descendants inherit the full matrix. `"approximate"` marks a view whose transform could not be read exactly (3D rotation, or no properties block matching the view's bounds). The result also carries `transformSource`: `"rendernode"`, or `"unavailable"` when the layout could not be located and bounds therefore ignore view transforms. `view_meta` reports the same two fields.
 
 ### `strsearch`
 Params: `{ needle: string, limit?: number, includeOwnerPreview?: boolean }`.

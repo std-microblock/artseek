@@ -4,6 +4,21 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions adhere to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- View bounds now include translation, scale and rotation. Since Android 5 these live only in
+  the native `RenderNode`, which was not read, so every view under a transformed ancestor (a
+  `CoordinatorLayout` child below a collapsing app bar, for example) was reported hundreds of
+  pixels away from where it is drawn. The properties block is located at runtime from the
+  view's own bounds, and the full matrix is propagated to descendants.
+
+### Added
+
+- `transform` on `ViewTreeNode` and `ViewMeta` (`"translate"`, `"affine"`, `"approximate"`).
+- `transformSource` on the `tree` result and `ViewMeta` (`"rendernode"` or `"unavailable"`).
+
 ## [0.1.1] - 2026-11-22
 
 ### Fixed
